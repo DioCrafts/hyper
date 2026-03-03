@@ -5,18 +5,21 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub(crate) struct BufList<T> {
     bufs: VecDeque<T>,
+    remaining: usize,
 }
 
 impl<T: Buf> BufList<T> {
     pub(crate) fn new() -> BufList<T> {
         BufList {
             bufs: VecDeque::new(),
+            remaining: 0,
         }
     }
 
     #[inline]
     pub(crate) fn push(&mut self, buf: T) {
         debug_assert!(buf.has_remaining());
+        self.remaining += buf.remaining();
         self.bufs.push_back(buf);
     }
 
@@ -29,7 +32,7 @@ impl<T: Buf> BufList<T> {
 impl<T: Buf> Buf for BufList<T> {
     #[inline]
     fn remaining(&self) -> usize {
-        self.bufs.iter().map(|buf| buf.remaining()).sum()
+        self.remaining
     }
 
     #[inline]
@@ -39,6 +42,8 @@ impl<T: Buf> Buf for BufList<T> {
 
     #[inline]
     fn advance(&mut self, mut cnt: usize) {
+        assert!(cnt <= self.remaining, "`cnt` greater than remaining");
+        self.remaining -= cnt;
         while cnt > 0 {
             {
                 let front = &mut self.bufs[0];
@@ -78,12 +83,18 @@ impl<T: Buf> Buf for BufList<T> {
             Some(front) if front.remaining() == len => {
                 let b = front.copy_to_bytes(len);
                 self.bufs.pop_front();
+                self.remaining -= len;
                 b
             }
-            Some(front) if front.remaining() > len => front.copy_to_bytes(len),
+            Some(front) if front.remaining() > len => {
+                self.remaining -= len;
+                front.copy_to_bytes(len)
+            }
             _ => {
-                assert!(len <= self.remaining(), "`len` greater than remaining");
+                assert!(len <= self.remaining, "`len` greater than remaining");
                 let mut bm = BytesMut::with_capacity(len);
+                // `bm.put(self.take(len))` calls `self.advance()` internally,
+                // which already decrements `self.remaining`.
                 bm.put(self.take(len));
                 bm.freeze()
             }
@@ -100,6 +111,7 @@ mod tests {
     fn hello_world_buf() -> BufList<Bytes> {
         BufList {
             bufs: vec![Bytes::from("Hello"), Bytes::from(" "), Bytes::from("World")].into(),
+            remaining: 11,
         }
     }
 
@@ -146,5 +158,73 @@ mod tests {
     #[should_panic(expected = "`len` greater than remaining")]
     fn buf_to_bytes_too_many() {
         hello_world_buf().copy_to_bytes(42);
+    }
+}
+
+#[cfg(all(test, feature = "nightly"))]
+mod bench {
+    use bytes::Bytes;
+    use test::Bencher;
+
+    use super::*;
+
+    fn create_buflist(count: usize) -> BufList<Bytes> {
+        let mut bl = BufList::new();
+        for _ in 0..count {
+            bl.push(Bytes::from_static(b"hello"));
+        }
+        bl
+    }
+
+    #[bench]
+    fn buflist_remaining_1_buf(b: &mut Bencher) {
+        let bl = create_buflist(1);
+        b.iter(|| test::black_box(bl.remaining()));
+    }
+
+    #[bench]
+    fn buflist_remaining_4_bufs(b: &mut Bencher) {
+        let bl = create_buflist(4);
+        b.iter(|| test::black_box(bl.remaining()));
+    }
+
+    #[bench]
+    fn buflist_remaining_16_bufs(b: &mut Bencher) {
+        let bl = create_buflist(16);
+        b.iter(|| test::black_box(bl.remaining()));
+    }
+
+    #[bench]
+    fn buflist_remaining_128_bufs(b: &mut Bencher) {
+        let bl = create_buflist(128);
+        b.iter(|| test::black_box(bl.remaining()));
+    }
+
+    #[bench]
+    fn buflist_remaining_1024_bufs(b: &mut Bencher) {
+        let bl = create_buflist(1024);
+        b.iter(|| test::black_box(bl.remaining()));
+    }
+
+    #[bench]
+    fn buflist_push_and_remaining_16(b: &mut Bencher) {
+        b.iter(|| {
+            let mut bl = BufList::new();
+            for _ in 0..16 {
+                bl.push(Bytes::from_static(b"hello"));
+                test::black_box(bl.remaining());
+            }
+        });
+    }
+
+    #[bench]
+    fn buflist_push_and_remaining_128(b: &mut Bencher) {
+        b.iter(|| {
+            let mut bl = BufList::new();
+            for _ in 0..128 {
+                bl.push(Bytes::from_static(b"hello"));
+                test::black_box(bl.remaining());
+            }
+        });
     }
 }
